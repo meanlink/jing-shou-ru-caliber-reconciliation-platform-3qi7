@@ -4,9 +4,10 @@ from sqlalchemy import select
 from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
-from src.models import Job, Dataset, Report
+from src.models import Job, Dataset, Report, WeeklyReport
 from src.services.business import analyze
 from src.services.reports import deliver
+from src.services import weekly
 from src.services.audit import record
 logging.basicConfig(level=logging.INFO)
 def execute(job_id):
@@ -34,6 +35,30 @@ def tick():
             d=deliver(db,r)
             if d:record(db,'worker','report.delivered',{'id':r.id,'delivery':d.id})
         db.commit()
+    tick_weekly()
+
+def tick_weekly():
+    # 单 worker 部署；Redis 锁保证同受众并发分发的串行化在多副本下也成立
+    r=Redis.from_url(REDIS_URL,socket_timeout=3)
+    lock=r.lock('weekly:publish:lock',timeout=30,blocking_timeout=2)
+    if not lock.acquire(blocking=True):
+        logging.warning('Weekly tick skipped: lock busy')
+        return
+    try:
+        with Session() as db:
+            due=list(db.scalars(select(WeeklyReport).where(
+                WeeklyReport.enabled==True, WeeklyReport.next_run<=time.time()
+            ).order_by(WeeklyReport.next_run.asc())))
+            for wr in due:
+                try:
+                    d=weekly.publish_due(db,wr)
+                    if d:record(db,'worker','weekly.publish',{'id':wr.id,'delivery':d.id,'status':d.status})
+                except Exception:
+                    logging.exception('Weekly publish failed for report %s',wr.id)
+            db.commit()
+    finally:
+        try:lock.release()
+        except Exception:logging.warning('Weekly lock already released')
 def main():
     r=Redis.from_url(REDIS_URL,socket_timeout=3)
     # This Compose stack has a single worker. A crash must not strand its jobs.
